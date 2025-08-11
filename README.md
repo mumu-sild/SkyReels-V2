@@ -45,7 +45,7 @@ The demos above showcase 30-second videos generated using our SkyReels-V2 Diffus
 - [x] Single-GPU & Multi-GPU Inference Code
 - [x] <a href="https://huggingface.co/Skywork/SkyCaptioner-V1">SkyCaptioner-V1</a>: A Video Captioning Model
 - [x] Prompt Enhancer
-- [ ] Diffusers integration
+- [x] Diffusers integration
 - [ ] Checkpoints of the 5B Models Series
 - [ ] Checkpoints of the Camera Director Models
 - [ ] Checkpoints of the Step & Guidance Distill Model
@@ -216,6 +216,92 @@ python3 generate_video_df.py \
   --offload
 ```
 
+Text-to-video with `diffusers`:
+```py
+import torch
+from diffusers import AutoModel, SkyReelsV2DiffusionForcingPipeline, UniPCMultistepScheduler
+from diffusers.utils import export_to_video
+
+vae = AutoModel.from_pretrained("Skywork/SkyReels-V2-DF-14B-540P-Diffusers", subfolder="vae", torch_dtype=torch.float32)
+
+pipeline = SkyReelsV2DiffusionForcingPipeline.from_pretrained(
+    "Skywork/SkyReels-V2-DF-14B-540P-Diffusers",
+    vae=vae,
+    torch_dtype=torch.bfloat16
+)
+flow_shift = 8.0  # 8.0 for T2V, 5.0 for I2V
+pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, flow_shift=flow_shift)
+pipeline = pipeline.to("cuda")
+
+prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+
+output = pipeline(
+    prompt=prompt,
+    num_inference_steps=30,
+    height=544,  # 720 for 720P
+    width=960,   # 1280 for 720P
+    num_frames=97,
+    base_num_frames=97,  # 121 for 720P
+    ar_step=5,  # Controls asynchronous inference (0 for synchronous mode)
+    causal_block_size=5,  # Number of frames in each block for asynchronous processing
+    overlap_history=None,  # Number of frames to overlap for smooth transitions in long videos; 17 for long video generations
+    addnoise_condition=20,  # Improves consistency in long video generation
+).frames[0]
+export_to_video(output, "T2V.mp4", fps=24, quality=8)
+```
+
+Image-to-video with `diffusers`:
+```py
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+from diffusers import AutoencoderKLWan, SkyReelsV2DiffusionForcingImageToVideoPipeline, UniPCMultistepScheduler
+from diffusers.utils import export_to_video, load_image
+
+model_id = "Skywork/SkyReels-V2-DF-14B-720P-Diffusers"
+vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+pipeline = SkyReelsV2DiffusionForcingImageToVideoPipeline.from_pretrained(
+    model_id, vae=vae, torch_dtype=torch.bfloat16
+)
+flow_shift = 5.0  # 8.0 for T2V, 5.0 for I2V
+pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, flow_shift=flow_shift)
+pipeline.to("cuda")
+
+first_frame = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/flf2v_input_first_frame.png")
+last_frame = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/flf2v_input_last_frame.png")
+
+def aspect_ratio_resize(image, pipeline, max_area=720 * 1280):
+    aspect_ratio = image.height / image.width
+    mod_value = pipeline.vae_scale_factor_spatial * pipeline.transformer.config.patch_size[1]
+    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+    image = image.resize((width, height))
+    return image, height, width
+
+def center_crop_resize(image, height, width):
+    # Calculate resize ratio to match first frame dimensions
+    resize_ratio = max(width / image.width, height / image.height)
+
+    # Resize the image
+    width = round(image.width * resize_ratio)
+    height = round(image.height * resize_ratio)
+    size = [width, height]
+    image = TF.center_crop(image, size)
+
+    return image, height, width
+
+first_frame, height, width = aspect_ratio_resize(first_frame, pipeline)
+if last_frame.size != first_frame.size:
+    last_frame, _, _ = center_crop_resize(last_frame, height, width)
+
+prompt = "CG animation style, a small blue bird takes off from the ground, flapping its wings. The bird's feathers are delicate, with a unique pattern on its chest. The background shows a blue sky with white clouds under bright sunshine. The camera follows the bird upward, capturing its flight and the vastness of the sky from a close-up, low-angle perspective."
+
+output = pipeline(
+    image=first_frame, last_image=last_frame, prompt=prompt, height=height, width=width, guidance_scale=5.0
+).frames[0]
+export_to_video(output, "output.mp4", fps=24, quality=8)
+```
+
 > **Note**: 
 > - If you want to run the **image-to-video (I2V)** task, add `--image ${image_path}` to your command and it is also better to use **text-to-video (T2V)**-like prompt which includes some descriptions of the first-frame image.
 > - For long video generation, you can just switch the `--num_frames`, e.g., `--num_frames 257` for 10s video, `--num_frames 377` for 15s video, `--num_frames 737` for 30s video, `--num_frames 1457` for 60s video. The number is not strictly aligned with the logical frame number for specified time duration, but it is aligned with some training parameters, which means it may perform better. When you use asynchronous inference with causal_block_size > 1, the `--num_frames` should be carefully set.
@@ -269,6 +355,35 @@ python3 generate_video_df.py \
 > **Note**:
 > - When controlling the start and end frames, you need to pass the `--image  ${image}` parameter to control the generation of the start frame and the `--end_image  ${end_image}` parameter to control the generation of the end frame.
 
+Video extension with `diffusers`:
+```py
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+from diffusers import AutoencoderKLWan, SkyReelsV2DiffusionForcingVideoToVideoPipeline, UniPCMultistepScheduler
+from diffusers.utils import export_to_video, load_video
+
+model_id = "Skywork/SkyReels-V2-DF-14B-540P-Diffusers"
+vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.float32)
+pipeline = SkyReelsV2DiffusionForcingVideoToVideoPipeline.from_pretrained(
+    model_id, vae=vae, torch_dtype=torch.bfloat16
+)
+flow_shift = 5.0  # 8.0 for T2V, 5.0 for I2V
+pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config, flow_shift=flow_shift)
+pipeline.to("cuda")
+
+video = load_video("input_video.mp4")
+
+prompt = "CG animation style, a small blue bird takes off from the ground, flapping its wings. The bird's feathers are delicate, with a unique pattern on its chest. The background shows a blue sky with white clouds under bright sunshine. The camera follows the bird upward, capturing its flight and the vastness of the sky from a close-up, low-angle perspective."
+
+output = pipeline(
+    video=video, prompt=prompt, height=544, width=960, guidance_scale=5.0,
+    num_inference_steps=30, num_frames=257, base_num_frames=97#, ar_step=5, causal_block_size=5,
+).frames[0]
+export_to_video(output, "output.mp4", fps=24, quality=8)
+# Total frames will be the number of frames of given video + 257
+```
+
 - **Text To Video & Image To Video**
 
 ```shell
@@ -291,6 +406,91 @@ python3 generate_video.py \
 > - When using an **image-to-video (I2V)** model, you must provide an input image using the `--image  ${image_path}` parameter. The `--guidance_scale 5.0` and `--shift 3.0` is recommended for I2V model.
 > - Generating a 540P video using the 1.3B model requires approximately 14.7GB peak VRAM, while the same resolution video using the 14B model demands around 43.4GB peak VRAM.
 
+T2V models with `diffusers`:
+```py
+import torch
+from diffusers import (
+    SkyReelsV2Pipeline,
+    UniPCMultistepScheduler,
+    AutoencoderKLWan,
+)
+from diffusers.utils import export_to_video
+
+# Load the pipeline
+# Available models:
+# - Skywork/SkyReels-V2-T2V-14B-540P-Diffusers
+# - Skywork/SkyReels-V2-T2V-14B-720P-Diffusers
+vae = AutoencoderKLWan.from_pretrained(
+    "Skywork/SkyReels-V2-T2V-14B-720P-Diffusers",
+    subfolder="vae",
+    torch_dtype=torch.float32,
+)
+pipe = SkyReelsV2Pipeline.from_pretrained(
+    "Skywork/SkyReels-V2-T2V-14B-720P-Diffusers",
+    vae=vae,
+    torch_dtype=torch.bfloat16,
+)
+flow_shift = 8.0  # 8.0 for T2V, 5.0 for I2V
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=flow_shift)
+pipe = pipe.to("cuda")
+
+prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+
+output = pipe(
+    prompt=prompt,
+    num_inference_steps=50,
+    height=544,
+    width=960,
+    guidance_scale=6.0,  # 6.0 for T2V, 5.0 for I2V
+    num_frames=97,
+).frames[0]
+export_to_video(output, "video.mp4", fps=24, quality=8)
+```
+
+I2V models with `diffusers`:
+```py
+import torch
+from diffusers import (
+    SkyReelsV2ImageToVideoPipeline,
+    UniPCMultistepScheduler,
+    AutoencoderKLWan,
+)
+from diffusers.utils import export_to_video
+from PIL import Image
+
+# Load the pipeline
+# Available models:
+# - Skywork/SkyReels-V2-I2V-1.3B-540P-Diffusers
+# - Skywork/SkyReels-V2-I2V-14B-540P-Diffusers
+# - Skywork/SkyReels-V2-I2V-14B-720P-Diffusers
+vae = AutoencoderKLWan.from_pretrained(
+    "Skywork/SkyReels-V2-I2V-14B-720P-Diffusers",
+    subfolder="vae",
+    torch_dtype=torch.float32,
+)
+pipe = SkyReelsV2ImageToVideoPipeline.from_pretrained(
+    "Skywork/SkyReels-V2-I2V-14B-720P-Diffusers",
+    vae=vae,
+    torch_dtype=torch.bfloat16,
+)
+flow_shift = 5.0  # 8.0 for T2V, 5.0 for I2V
+pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config, flow_shift=flow_shift)
+pipe = pipe.to("cuda")
+
+prompt = "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window."
+image = Image.open("path/to/image.png")
+
+output = pipe(
+    image=image,
+    prompt=prompt,
+    num_inference_steps=50,
+    height=544,
+    width=960,
+    guidance_scale=5.0,  # 6.0 for T2V, 5.0 for I2V
+    num_frames=97,
+).frames[0]
+export_to_video(output, "video.mp4", fps=24, quality=8)
+```
 
 - **Prompt Enhancer**
 
